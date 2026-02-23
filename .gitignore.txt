@@ -1,0 +1,21 @@
+# ─────────────────────────────────────────────────────
+# VARIABLES DE ENTORNO - ETH Signals Bot
+# Copiá esto en Railway > Variables
+# NUNCA subas este archivo a GitHub con datos reales
+# ─────────────────────────────────────────────────────
+
+# Supabase (lo tenés en tu proyecto)
+SUPABASE_URL=https://adasxofefyhhteimkfvb.supabase.co
+SUPABASE_KEY=tu_supabase_anon_key_aqui
+
+# Gmail (la cuenta NUEVA dedicada al bot)
+GMAIL_USER=tu_cuenta_bot@gmail.com
+GMAIL_APP_PASS=xxxx xxxx xxxx xxxx
+
+# Tu mail donde querés recibir alertas
+MAIL_TO=tu_mail_personal@gmail.com
+
+# Configuración del bot (opcionales, tienen defaults)
+CHECK_EVERY_SECONDS=300    # cada cuántos segundos revisa (300 = 5 min)
+MIN_SCORE=4                # score mínimo para disparar alerta
+COOLDOWN_HOURS=1           # horas entre alertas de la misma clase
