@@ -584,7 +584,7 @@ def main():
             if should_alert(clase):
                 log.info(f"→ Disparando alerta: {data['label']}")
                 tags = save_alert(data)
-                send_email(data, tags)
+                //send_email(data, tags)
                 last_alert["clase"] = clase
                 last_alert["ts"]    = time.time()
             else:
