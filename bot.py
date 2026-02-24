@@ -1,8 +1,8 @@
 """
-ETH Signals Bot - v3 CoinGecko
-Usa CoinGecko (sin restricciones geográficas, sin API key).
-Corre cada 5 minutos, calcula indicadores técnicos sobre ETH/USDT
-y guarda en Supabase cuando hay señal. Email opcional.
+ETH Signals Bot - v4 Kraken
+Usa Kraken public API (sin key, sin restricciones geograficas).
+Corre cada 5 minutos, calcula indicadores tecnicos sobre ETH/USD
+y guarda en Supabase cuando hay senal. Email opcional.
 """
 
 import os
@@ -10,7 +10,6 @@ import time
 import logging
 import requests
 import smtplib
-import json
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -29,9 +28,10 @@ CHECK_EVERY  = int(os.getenv("CHECK_EVERY_SECONDS", "300"))
 MIN_SCORE    = int(os.getenv("MIN_SCORE", "4"))
 COOLDOWN_H   = int(os.getenv("COOLDOWN_HOURS", "1"))
 
-COINGECKO    = "https://api.coingecko.com/api/v3"
-COIN_ID      = "ethereum"
-SYMBOL       = "ETH/USDT"
+KRAKEN       = "https://api.kraken.com/0/public/OHLC"
+PAIR         = "ETHUSD"
+# Kraken intervals in minutes: 15, 60, 240
+INTERVALS    = {"15m": 15, "1h": 60, "4h": 240}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +44,7 @@ last_alert = {"clase": None, "ts": 0}
 
 
 # ─────────────────────────────────────────
-# MATH HELPERS
+# MATH
 # ─────────────────────────────────────────
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -52,22 +52,20 @@ def calc_rsi(closes, period=14):
     gains, losses = 0.0, 0.0
     for i in range(1, period + 1):
         d = closes[i] - closes[i - 1]
-        if d > 0:   gains  += d
-        else:       losses -= d
-    avg_g, avg_l = gains / period, losses / period
+        if d > 0:  gains  += d
+        else:      losses -= d
+    ag, al = gains / period, losses / period
     for i in range(period + 1, len(closes)):
         d = closes[i] - closes[i - 1]
-        avg_g = (avg_g * (period - 1) + (d if d > 0 else 0)) / period
-        avg_l = (avg_l * (period - 1) + (-d if d < 0 else 0)) / period
-    if avg_l == 0:
-        return 100.0
-    return 100.0 - (100.0 / (1.0 + avg_g / avg_l))
+        ag = (ag * (period - 1) + (d if d > 0 else 0)) / period
+        al = (al * (period - 1) + (-d if d < 0 else 0)) / period
+    return 100.0 if al == 0 else 100.0 - (100.0 / (1.0 + ag / al))
 
 
 def calc_ema(closes, period):
     if len(closes) < period:
         return None
-    k = 2.0 / (period + 1)
+    k   = 2.0 / (period + 1)
     ema = sum(closes[:period]) / period
     for c in closes[period:]:
         ema = c * k + ema * (1 - k)
@@ -77,26 +75,26 @@ def calc_ema(closes, period):
 def calc_macd(closes):
     if len(closes) < 35:
         return None
-    macd_arr = []
+    arr = []
     for i in range(26, len(closes) + 1):
         e12 = calc_ema(closes[:i], 12)
         e26 = calc_ema(closes[:i], 26)
         if e12 and e26:
-            macd_arr.append(e12 - e26)
-    if len(macd_arr) < 9:
+            arr.append(e12 - e26)
+    if len(arr) < 9:
         return None
-    signal   = calc_ema(macd_arr, 9)
-    macd_val = macd_arr[-1]
-    return {"macd": macd_val, "signal": signal, "hist": macd_val - (signal or 0)}
+    sig = calc_ema(arr, 9)
+    val = arr[-1]
+    return {"macd": val, "signal": sig, "hist": val - (sig or 0)}
 
 
-def calc_bollinger(closes, period=20, std_mult=2):
+def calc_bollinger(closes, period=20, mult=2):
     if len(closes) < period:
         return None
     sl  = closes[-period:]
     avg = sum(sl) / period
     sd  = (sum((x - avg) ** 2 for x in sl) / period) ** 0.5
-    return {"upper": avg + std_mult * sd, "mid": avg, "lower": avg - std_mult * sd}
+    return {"upper": avg + mult * sd, "mid": avg, "lower": avg - mult * sd}
 
 
 # ─────────────────────────────────────────
@@ -108,15 +106,9 @@ def detect_spike(candles):
     changes = [abs((c["close"] - c["open"]) / max(c["open"], 0.01) * 100)
                for c in candles[-20:-1]]
     avg  = sum(changes) / len(changes) if changes else 0.01
-    last_c = candles[-1]
-    last = (last_c["close"] - last_c["open"]) / max(last_c["open"], 0.01) * 100
+    last = (candles[-1]["close"] - candles[-1]["open"]) / max(candles[-1]["open"], 0.01) * 100
     ratio = abs(last) / max(avg, 0.01)
-    return {
-        "last":       last,
-        "ratio":      ratio,
-        "is_anomaly": ratio > 3,
-        "is_large":   abs(last) > 2,
-    }
+    return {"last": last, "ratio": ratio, "is_anomaly": ratio > 3, "is_large": abs(last) > 2}
 
 
 def detect_volume(candles):
@@ -140,118 +132,48 @@ def detect_24h(candles_1h):
 def detect_volatility(candles):
     if len(candles) < 21:
         return None
-    trs  = [c["high"] - c["low"] for c in candles[-21:]]
-    avg  = sum(trs[:-1]) / 20
+    trs   = [c["high"] - c["low"] for c in candles[-21:]]
+    avg   = sum(trs[:-1]) / 20
     ratio = trs[-1] / max(avg, 0.01)
     return {"ratio": ratio, "is_spike": ratio > 2}
 
 
 # ─────────────────────────────────────────
-# FETCH FROM COINGECKO
+# FETCH FROM KRAKEN
 # ─────────────────────────────────────────
-def fetch_market_chart(days, interval="hourly"):
+def fetch_candles(interval_key, limit=150):
     """
-    Returns list of candle dicts with open/high/low/close/volume.
-    CoinGecko market_chart gives prices and volumes as [timestamp, value].
-    We convert to OHLCV by treating each price point as a candle close
-    and deriving open from the previous close.
+    Kraken OHLC: returns [time, open, high, low, close, vwap, volume, count]
+    interval in minutes: 15, 60, 240
     """
-    url = (f"{COINGECKO}/coins/{COIN_ID}/market_chart"
-           f"?vs_currency=usd&days={days}&interval={interval}")
-    r = requests.get(url, timeout=15, headers={"Accept": "application/json"})
+    interval = INTERVALS[interval_key]
+    url = f"{KRAKEN}?pair={PAIR}&interval={interval}"
+    r   = requests.get(url, timeout=15)
     r.raise_for_status()
-    data     = r.json()
-    prices   = data["prices"]          # [[ts, price], ...]
-    volumes  = data["total_volumes"]   # [[ts, vol], ...]
+    data = r.json()
 
-    # Align volumes to prices by index (same length)
+    if data.get("error"):
+        raise Exception(f"Kraken error: {data['error']}")
+
+    # Key is usually "XETHUSD" or "ETHUSD"
+    result = data.get("result", {})
+    key    = next((k for k in result if k != "last"), None)
+    if not key:
+        raise Exception("Kraken: no data in response")
+
+    raw = result[key]
+    # Kraken returns oldest first, last entry is usually incomplete — skip it
     candles = []
-    for i in range(1, len(prices)):
-        ts    = prices[i][0]
-        close = prices[i][1]
-        open_ = prices[i - 1][1]
-        high  = max(open_, close) * 1.001   # CoinGecko has no H/L, approximate
-        low   = min(open_, close) * 0.999
-        vol   = volumes[i][1] if i < len(volumes) else 0
+    for c in raw[:-1]:
         candles.append({
-            "ts":     ts,
-            "open":   open_,
-            "high":   high,
-            "low":    low,
-            "close":  close,
-            "volume": vol,
+            "ts":     int(c[0]),
+            "open":   float(c[1]),
+            "high":   float(c[2]),
+            "low":    float(c[3]),
+            "close":  float(c[4]),
+            "volume": float(c[6]),
         })
-    return candles
-
-
-def get_candles_1h(limit=150):
-    """Hourly candles from last 7 days (~168 candles)."""
-    return fetch_market_chart(days=7, interval="hourly")[-limit:]
-
-
-def get_candles_4h(limit=100):
-    """
-    4h candles: fetch 30 days hourly and group every 4 candles.
-    """
-    raw = fetch_market_chart(days=30, interval="hourly")
-    candles_4h = []
-    # Group in blocks of 4
-    i = 0
-    while i + 3 < len(raw):
-        block = raw[i:i + 4]
-        candles_4h.append({
-            "ts":     block[-1]["ts"],
-            "open":   block[0]["open"],
-            "high":   max(c["high"] for c in block),
-            "low":    min(c["low"] for c in block),
-            "close":  block[-1]["close"],
-            "volume": sum(c["volume"] for c in block),
-        })
-        i += 4
-    return candles_4h[-limit:]
-
-
-def get_candles_15m(limit=150):
-    """
-    15m candles: CoinGecko free tier returns ~5min data for last 1 day.
-    We use it as short-timeframe proxy.
-    """
-    # days=1 without interval param gives auto granularity (~5min for 1 day)
-    raw = fetch_market_chart(days=1, interval="")
-    return raw[-limit:] if raw else []
-
-
-def fetch_market_chart(days, interval="hourly"):
-    """Fetch market chart, handle empty interval param."""
-    if interval:
-        url = (f"{COINGECKO}/coins/{COIN_ID}/market_chart"
-               f"?vs_currency=usd&days={days}&interval={interval}")
-    else:
-        url = (f"{COINGECKO}/coins/{COIN_ID}/market_chart"
-               f"?vs_currency=usd&days={days}")
-
-    r = requests.get(url, timeout=15, headers={"Accept": "application/json"})
-    r.raise_for_status()
-    data    = r.json()
-    prices  = data["prices"]
-    volumes = data["total_volumes"]
-
-    candles = []
-    for i in range(1, len(prices)):
-        close = prices[i][1]
-        open_ = prices[i - 1][1]
-        high  = max(open_, close) * 1.001
-        low   = min(open_, close) * 0.999
-        vol   = volumes[i][1] if i < len(volumes) else 0
-        candles.append({
-            "ts":     prices[i][0],
-            "open":   open_,
-            "high":   high,
-            "low":    low,
-            "close":  close,
-            "volume": vol,
-        })
-    return candles
+    return candles[-limit:]
 
 
 # ─────────────────────────────────────────
@@ -271,24 +193,20 @@ def score_timeframe(candles):
     ema20  = calc_ema(closes, 20)
     ema50  = calc_ema(closes, 50)
     ema200 = calc_ema(closes, 200)
+    score  = 0
 
-    score = 0
-
-    # RSI ±2
     if rsi is not None:
-        if rsi < 25:    score += 2
+        if   rsi < 25:  score += 2
         elif rsi < 35:  score += 1
         elif rsi > 75:  score -= 2
         elif rsi > 65:  score -= 1
 
-    # MACD ±2
     if macd:
         if   macd["hist"] > 0 and macd["macd"] > 0:  score += 2
         elif macd["hist"] > 0:                         score += 1
         elif macd["hist"] < 0 and macd["macd"] < 0:   score -= 2
         else:                                           score -= 1
 
-    # EMA 20/50 ±2
     if ema20 and ema50:
         diff = (ema20 - ema50) / ema50 * 100
         if   ema20 > ema50 and diff >  0.5:  score += 2
@@ -296,38 +214,34 @@ def score_timeframe(candles):
         elif ema20 < ema50 and diff < -0.5:  score -= 2
         else:                                 score -= 1
 
-    # Bollinger ±1
     if bb:
         if   price <= bb["lower"]:  score += 1
         elif price >= bb["upper"]:  score -= 1
 
-    # EMA200 ±1
     if ema200:
         if   price > ema200 * 1.01:   score += 1
         elif price < ema200 * 0.99:   score -= 1
 
-    label = "▲ LONG" if score >= 3 else "▼ SHORT" if score <= -3 else "◆ NEUTRAL"
-    cls   = "long"   if score >= 3 else "short"   if score <= -3 else "neutral"
+    label = "LONG"    if score >= 3  else "SHORT"   if score <= -3  else "NEUTRAL"
+    cls   = "long"    if score >= 3  else "short"   if score <= -3  else "neutral"
 
-    return {
-        "score": score, "label": label, "cls": cls,
-        "rsi": rsi, "macd": macd, "bb": bb,
-        "ema20": ema20, "ema50": ema50, "ema200": ema200, "price": price,
-    }
+    return {"score": score, "label": label, "cls": cls,
+            "rsi": rsi, "macd": macd, "bb": bb,
+            "ema20": ema20, "ema50": ema50, "ema200": ema200, "price": price}
 
 
 # ─────────────────────────────────────────
 # MAIN ANALYSIS
 # ─────────────────────────────────────────
 def analyze():
-    log.info("Fetching data from CoinGecko...")
+    log.info("Fetching candles from Kraken...")
 
-    c15m = get_candles_15m(150)
-    c1h  = get_candles_1h(150)
-    c4h  = get_candles_4h(100)
+    c15m = fetch_candles("15m", 150)
+    c1h  = fetch_candles("1h",  150)
+    c4h  = fetch_candles("4h",  100)
 
     if not c1h:
-        raise Exception("No se pudo obtener datos de CoinGecko")
+        raise Exception("No se obtuvieron datos de Kraken")
 
     r15 = score_timeframe(c15m)
     r1h = score_timeframe(c1h)
@@ -343,7 +257,7 @@ def analyze():
 
     # Volume anomaly ±2
     if vol1h and vol1h["is_anomaly"]:
-        direction = (1 if spike1h and spike1h["last"] < 0
+        direction = (1  if spike1h and spike1h["last"] < 0
                      else -1 if spike1h and spike1h["last"] > 0
                      else 0)
         total += direction * (2 if vol1h["is_extreme"] else 1)
@@ -360,21 +274,21 @@ def analyze():
         total += 1 if r1h["cls"] == "long" else -1
 
     anom_fired = (
-        (vol1h  and vol1h["is_anomaly"])  or
-        (spike1h and spike1h["is_large"]) or
-        (ch24   and ch24["is_unusual"])
+        (vol1h   and vol1h["is_anomaly"])   or
+        (spike1h and spike1h["is_large"])   or
+        (ch24    and ch24["is_unusual"])
     )
 
-    max_score = 11  # sin funding rate
+    max_score = 11
 
-    if   total >=  7:   label, clase = "LONG FUERTE",        "long"
-    elif total >=  MIN_SCORE: label, clase = "SENAL LONG",   "long"
-    elif total <= -7:   label, clase = "SHORT FUERTE",       "short"
-    elif total <= -MIN_SCORE: label, clase = "SENAL SHORT",  "short"
-    elif anom_fired:    label, clase = "MOVIMIENTO ANOMALO", "warning"
-    else:               label, clase = "SIN SENAL",          "neutral"
+    if   total >=  7:          label, clase = "LONG FUERTE",   "long"
+    elif total >=  MIN_SCORE:  label, clase = "SENAL LONG",    "long"
+    elif total <= -7:          label, clase = "SHORT FUERTE",  "short"
+    elif total <= -MIN_SCORE:  label, clase = "SENAL SHORT",   "short"
+    elif anom_fired:           label, clase = "ANOMALIA",      "warning"
+    else:                      label, clase = "SIN SENAL",     "neutral"
 
-    price = r1h["price"]
+    price   = r1h["price"]
     rsi_str = f"{r1h['rsi']:.1f}" if r1h["rsi"] else "—"
     log.info(f"Score: {total:+d}/{max_score}  |  {label}  |  ETH ${price:.2f}  |  RSI {rsi_str}")
 
@@ -382,7 +296,6 @@ def analyze():
         "total": total, "max_score": max_score,
         "label": label, "clase": clase, "price": price,
         "r15": r15, "r1h": r1h, "r4h": r4h,
-        "fund": None, "fund_sig": "N/A (CoinGecko)", "fund_score": 0,
         "spike15": spike15, "spike1h": spike1h,
         "vol1h": vol1h, "ch24": ch24, "volat": volat,
         "anom_fired": anom_fired,
@@ -390,7 +303,7 @@ def analyze():
 
 
 # ─────────────────────────────────────────
-# SUPABASE SAVE
+# SUPABASE
 # ─────────────────────────────────────────
 def save_alert(data):
     r1h = data["r1h"]
@@ -418,21 +331,18 @@ def save_alert(data):
         "score_max":    data["max_score"],
         "senal":        data["label"],
         "clase":        data["clase"],
-        "rsi":          round(r1h["rsi"], 2)          if r1h["rsi"]   else None,
-        "macd":         round(r1h["macd"]["macd"], 4) if r1h["macd"]  else None,
-        "macd_hist":    round(r1h["macd"]["hist"], 4) if r1h["macd"]  else None,
-        "ema20":        round(r1h["ema20"], 4)         if r1h["ema20"] else None,
-        "ema50":        round(r1h["ema50"], 4)         if r1h["ema50"] else None,
+        "rsi":          round(r1h["rsi"], 2)          if r1h["rsi"]    else None,
+        "macd":         round(r1h["macd"]["macd"], 4) if r1h["macd"]   else None,
+        "macd_hist":    round(r1h["macd"]["hist"], 4) if r1h["macd"]   else None,
+        "ema20":        round(r1h["ema20"], 4)         if r1h["ema20"]  else None,
+        "ema50":        round(r1h["ema50"], 4)         if r1h["ema50"]  else None,
         "ema200":       round(r1h["ema200"], 4)        if r1h["ema200"] else None,
-        "bb_upper":     round(r1h["bb"]["upper"], 4)  if r1h["bb"]    else None,
-        "bb_lower":     round(r1h["bb"]["lower"], 4)  if r1h["bb"]    else None,
+        "bb_upper":     round(r1h["bb"]["upper"], 4)  if r1h["bb"]     else None,
+        "bb_lower":     round(r1h["bb"]["lower"], 4)  if r1h["bb"]     else None,
         "funding":      None,
-        "tf_15m_score": r15["score"],
-        "tf_15m_senal": r15["label"],
-        "tf_1h_score":  r1h["score"],
-        "tf_1h_senal":  r1h["label"],
-        "tf_4h_score":  r4h["score"],
-        "tf_4h_senal":  r4h["label"],
+        "tf_15m_score": r15["score"],  "tf_15m_senal": r15["label"],
+        "tf_1h_score":  r1h["score"],  "tf_1h_senal":  r1h["label"],
+        "tf_4h_score":  r4h["score"],  "tf_4h_senal":  r4h["label"],
         "spike_pct":    round(data["spike1h"]["last"], 4)  if data["spike1h"] else None,
         "vol_ratio":    round(data["vol1h"]["ratio"], 4)   if data["vol1h"]   else None,
         "change_24h":   round(data["ch24"]["change"], 4)   if data["ch24"]    else None,
@@ -449,12 +359,8 @@ def save_alert(data):
     }
 
     try:
-        r = requests.post(
-            f"{SUPA_URL}/rest/v1/alertas",
-            headers=headers,
-            json=payload,
-            timeout=10,
-        )
+        r = requests.post(f"{SUPA_URL}/rest/v1/alertas",
+                          headers=headers, json=payload, timeout=10)
         if r.ok:
             log.info("Alerta guardada en Supabase OK")
         else:
@@ -480,13 +386,13 @@ def send_email(data, tags):
     color = "#00e676" if clase == "long" else "#ff4444" if clase == "short" else "#ff9800"
     emoji = "🚀" if total >= 7 else "📈" if clase == "long" else "🔻" if total <= -7 else "📉" if clase == "short" else "⚠️"
 
-    if   total >= 7:        desc = "Todos los indicadores alineados alcistas. Alta confianza."
-    elif clase == "long":   desc = "Sesgo alcista. Confirma con 4H antes de entrar."
-    elif total <= -7:       desc = "Todos los indicadores bajistas. Alta confianza."
-    elif clase == "short":  desc = "Sesgo bajista. Confirma en 4H antes de shortear."
-    else:                   desc = "Movimiento inusual. Espera confirmacion tecnica."
+    if   total >= 7:       desc = "Todos los indicadores alineados alcistas. Alta confianza."
+    elif clase == "long":  desc = "Sesgo alcista. Confirma con 4H antes de entrar."
+    elif total <= -7:      desc = "Todos los indicadores bajistas. Alta confianza."
+    elif clase == "short": desc = "Sesgo bajista. Confirma en 4H antes de shortear."
+    else:                  desc = "Movimiento inusual. Espera confirmacion tecnica."
 
-    rsi_val  = f"{r1h['rsi']:.1f}"       if r1h["rsi"]  else "—"
+    rsi_val  = f"{r1h['rsi']:.1f}" if r1h["rsi"] else "—"
     rsi_col  = "#00e676" if r1h["rsi"] and r1h["rsi"] < 35 else "#ff4444" if r1h["rsi"] and r1h["rsi"] > 65 else "#7a9ab5"
     macd_val = f"{r1h['macd']['macd']:+.2f}" if r1h["macd"] else "—"
     macd_col = "#00e676" if r1h["macd"] and r1h["macd"]["hist"] > 0 else "#ff4444"
@@ -514,57 +420,45 @@ def send_email(data, tags):
 <body style="background:#080c10;color:#e0eaf5;font-family:sans-serif;padding:0;margin:0;">
 <div style="max-width:580px;margin:0 auto;padding:20px 16px;">
   <div style="background:#0d1318;border:1px solid #1e2d3d;border-radius:12px;padding:20px 24px;margin-bottom:14px;">
-    <div style="font-family:monospace;font-size:9px;color:#3d5a73;letter-spacing:2px;margin-bottom:8px;">CRYPTOBOOK · ETH/USDT · SEÑAL AUTOMATICA · CoinGecko</div>
+    <div style="font-family:monospace;font-size:9px;color:#3d5a73;letter-spacing:2px;margin-bottom:8px;">CRYPTOBOOK · ETH/USD · KRAKEN</div>
     <div style="font-size:24px;font-weight:900;color:{color};margin-bottom:6px;">{emoji} {label}</div>
     <div style="font-family:monospace;font-size:22px;font-weight:700;color:#00e5ff;margin-bottom:8px;">${price:,.2f} USD</div>
     <div style="font-family:monospace;font-size:10px;color:#7a9ab5;line-height:1.6;">{desc}</div>
   </div>
   <div style="background:#0d1318;border:1px solid #1e2d3d;border-left:4px solid {color};border-radius:12px;padding:16px 20px;margin-bottom:14px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
-      <div>
-        <div style="font-family:monospace;font-size:9px;color:#3d5a73;letter-spacing:2px;margin-bottom:4px;">SCORE TOTAL</div>
-        <div style="font-family:monospace;font-size:40px;font-weight:700;color:{color};line-height:1;">{total:+d}</div>
-        <div style="font-family:monospace;font-size:9px;color:#3d5a73;">de {data['max_score']} posibles</div>
-      </div>
-      <table style="border-collapse:collapse;">
-        {tf_row(data['r15'], '15M')}
-        {tf_row(data['r1h'], '1H')}
-        {tf_row(data['r4h'], '4H')}
-      </table>
-    </div>
+    <table style="width:100%;border-collapse:collapse;">
+      <tr>
+        <td style="vertical-align:top;">
+          <div style="font-family:monospace;font-size:9px;color:#3d5a73;letter-spacing:2px;margin-bottom:4px;">SCORE</div>
+          <div style="font-family:monospace;font-size:40px;font-weight:700;color:{color};line-height:1;">{total:+d}</div>
+          <div style="font-family:monospace;font-size:9px;color:#3d5a73;">de {data['max_score']}</div>
+        </td>
+        <td style="text-align:right;vertical-align:top;">
+          <table style="border-collapse:collapse;">
+            {tf_row(data['r15'], '15M')}
+            {tf_row(data['r1h'], '1H')}
+            {tf_row(data['r4h'], '4H')}
+          </table>
+        </td>
+      </tr>
+    </table>
   </div>
   <div style="background:#0d1318;border:1px solid #1e2d3d;border-radius:12px;padding:16px 20px;margin-bottom:14px;">
     <div style="font-family:monospace;font-size:9px;color:#3d5a73;letter-spacing:2px;margin-bottom:12px;">INDICADORES</div>
     <table style="width:100%;border-collapse:collapse;">
-      <tr style="border-bottom:1px solid #1e2d3d;">
-        <td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">RSI 14</td>
-        <td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{rsi_col};text-align:right;">{rsi_val}</td>
-      </tr>
-      <tr style="border-bottom:1px solid #1e2d3d;">
-        <td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">MACD</td>
-        <td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{macd_col};text-align:right;">{macd_val}</td>
-      </tr>
-      <tr style="border-bottom:1px solid #1e2d3d;">
-        <td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">EMA 20/50</td>
-        <td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{ema_col};text-align:right;">{ema_val}</td>
-      </tr>
-      <tr style="border-bottom:1px solid #1e2d3d;">
-        <td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">VOLUMEN</td>
-        <td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{vol_col};text-align:right;">{vol_val}</td>
-      </tr>
-      <tr>
-        <td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">VARIACION 24H</td>
-        <td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{ch24_col};text-align:right;">{ch24_val}</td>
-      </tr>
+      <tr style="border-bottom:1px solid #1e2d3d;"><td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">RSI 14</td><td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{rsi_col};text-align:right;">{rsi_val}</td></tr>
+      <tr style="border-bottom:1px solid #1e2d3d;"><td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">MACD</td><td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{macd_col};text-align:right;">{macd_val}</td></tr>
+      <tr style="border-bottom:1px solid #1e2d3d;"><td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">EMA 20/50</td><td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{ema_col};text-align:right;">{ema_val}</td></tr>
+      <tr style="border-bottom:1px solid #1e2d3d;"><td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">VOLUMEN</td><td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{vol_col};text-align:right;">{vol_val}</td></tr>
+      <tr><td style="padding:8px 0;font-family:monospace;font-size:10px;color:#3d5a73;">VARIACION 24H</td><td style="padding:8px 0;font-family:monospace;font-size:12px;font-weight:700;color:{ch24_col};text-align:right;">{ch24_val}</td></tr>
     </table>
   </div>
   {'<div style="background:#0d1318;border:1px solid #1e2d3d;border-radius:12px;padding:14px 20px;margin-bottom:14px;">' + tags_html + '</div>' if tags_html else ''}
   <div style="font-family:monospace;font-size:9px;color:#3d5a73;line-height:1.7;border-top:1px solid #1e2d3d;padding-top:12px;">
-    Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')} | CryptoBook ETH Bot<br>
-    Sin garantias. Siempre usa stop loss. No operes con dinero que no puedas perder.
+    {datetime.now().strftime('%d/%m/%Y %H:%M')} | CryptoBook ETH Bot | Kraken<br>
+    Sin garantias. Siempre usa stop loss.
   </div>
-</div>
-</body></html>"""
+</div></body></html>"""
 
     subject = f"{emoji} ETH {label} | Score {total:+d} | ${price:,.0f}"
     msg = MIMEMultipart("alternative")
@@ -588,11 +482,11 @@ def send_email(data, tags):
 def should_alert(clase):
     if clase == "neutral":
         return False
-    now = time.time()
+    now      = time.time()
     cooldown = COOLDOWN_H * 3600
     if last_alert["clase"] == clase and (now - last_alert["ts"]) < cooldown:
         mins = int((cooldown - (now - last_alert["ts"])) / 60)
-        log.info(f"Cooldown activo para '{clase}' — {mins} min restantes")
+        log.info(f"Cooldown activo '{clase}' — {mins} min restantes")
         return False
     return True
 
@@ -602,7 +496,7 @@ def should_alert(clase):
 # ─────────────────────────────────────────
 def main():
     log.info("=" * 52)
-    log.info("  ETH Signals Bot  —  CoinGecko edition 1")
+    log.info("  ETH Signals Bot  —  Kraken edition")
     log.info(f"  Intervalo: {CHECK_EVERY}s  |  Min score: +/-{MIN_SCORE}  |  Cooldown: {COOLDOWN_H}h")
     log.info(f"  Email: {'ACTIVADO -> ' + MAIL_TO if MAIL_ENABLED else 'DESACTIVADO (solo Supabase)'}")
     log.info("=" * 52)
