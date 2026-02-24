@@ -27,8 +27,8 @@ CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))   # 5 min por defecto
 MIN_SCORE   = int(os.getenv("MIN_SCORE", "4"))               # umbral para alertar
 COOLDOWN_H  = int(os.getenv("COOLDOWN_HOURS", "1"))          # horas entre alertas iguales
 
-BINANCE     = "https://api.binance.com/api/v3"
-BINANCE_F   = "https://fapi.binance.com/fapi/v1"
+BYBIT       = "https://api.bybit.com/v5/market"
+# Bybit unifica spot y futuros en la misma API
 SYMBOL      = "ETHUSDT"
 
 logging.basicConfig(
@@ -143,30 +143,45 @@ def detect_volatility(candles):
 
 
 # ─────────────────────────────────────────
-# FETCH FROM BINANCE
+# FETCH FROM BYBIT
 # ─────────────────────────────────────────
+# Bybit interval map: 15m->15, 1h->60, 4h->240
+INTERVAL_MAP = {"15m": "15", "1h": "60", "4h": "240"}
+
 def fetch_candles(symbol, interval, limit=150):
-    url = f"{BINANCE}/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    iv = INTERVAL_MAP.get(interval, interval)
+    url = f"{BYBIT}/kline?category=linear&symbol={symbol}&interval={iv}&limit={limit}"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
-    return [
-        {
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise Exception(f"Bybit error: {data.get('retMsg')}")
+    # Bybit returns newest first, reverse to get oldest first
+    # Each item: [startTime, open, high, low, close, volume, turnover]
+    candles = []
+    for c in reversed(data["result"]["list"]):
+        candles.append({
             "open":   float(c[1]),
             "high":   float(c[2]),
             "low":    float(c[3]),
             "close":  float(c[4]),
             "volume": float(c[5]),
-        }
-        for c in r.json()
-    ]
+        })
+    return candles
 
 
 def fetch_funding():
     try:
-        url = f"{BINANCE_F}/premiumIndex?symbol={SYMBOL}"
+        url = f"{BYBIT}/tickers?category=linear&symbol={SYMBOL}"
         r = requests.get(url, timeout=10)
         r.raise_for_status()
-        return float(r.json()["lastFundingRate"])
+        data = r.json()
+        if data.get("retCode") != 0:
+            return None
+        items = data["result"]["list"]
+        if not items:
+            return None
+        return float(items[0]["fundingRate"])
     except Exception:
         return None
 
