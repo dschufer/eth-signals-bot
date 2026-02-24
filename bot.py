@@ -19,9 +19,10 @@ from email.mime.text import MIMEText
 # ─────────────────────────────────────────
 SUPA_URL    = os.environ["SUPABASE_URL"]
 SUPA_KEY    = os.environ["SUPABASE_KEY"]
-GMAIL_USER  = os.environ["GMAIL_USER"]       # tu cuenta gmail dedicada
-GMAIL_PASS  = os.environ["GMAIL_APP_PASS"]   # contraseña de aplicación
-MAIL_TO     = os.environ["MAIL_TO"]          # tu mail donde recibís alertas
+GMAIL_USER  = os.getenv("GMAIL_USER", "")       # opcional
+GMAIL_PASS  = os.getenv("GMAIL_APP_PASS", "")   # opcional
+MAIL_TO     = os.getenv("MAIL_TO", "")          # opcional
+MAIL_ENABLED = bool(GMAIL_USER and GMAIL_PASS and MAIL_TO)
 CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))   # 5 min por defecto
 MIN_SCORE   = int(os.getenv("MIN_SCORE", "4"))               # umbral para alertar
 COOLDOWN_H  = int(os.getenv("COOLDOWN_HOURS", "1"))          # horas entre alertas iguales
@@ -584,7 +585,10 @@ def main():
             if should_alert(clase):
                 log.info(f"→ Disparando alerta: {data['label']}")
                 tags = save_alert(data)
-                #send_email(data, tags)
+                if MAIL_ENABLED:
+                    send_email(data, tags)
+                else:
+                    log.info("Email desactivado - alerta guardada solo en Supabase")
                 last_alert["clase"] = clase
                 last_alert["ts"]    = time.time()
             else:
