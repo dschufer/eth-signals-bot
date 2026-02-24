@@ -602,7 +602,7 @@ def should_alert(clase):
 # ─────────────────────────────────────────
 def main():
     log.info("=" * 52)
-    log.info("  ETH Signals Bot  —  CoinGecko edition")
+    log.info("  ETH Signals Bot  —  CoinGecko edition 1")
     log.info(f"  Intervalo: {CHECK_EVERY}s  |  Min score: +/-{MIN_SCORE}  |  Cooldown: {COOLDOWN_H}h")
     log.info(f"  Email: {'ACTIVADO -> ' + MAIL_TO if MAIL_ENABLED else 'DESACTIVADO (solo Supabase)'}")
     log.info("=" * 52)
